@@ -2,20 +2,20 @@
 # -*- coding: utf-8 -*-
 
 """
-CAPS PET regional stats using GTMSeg-on-MNI (affine), flexible for FDG and AV45.
+CAPS PET Regional Statistics (NO normalization; uses Clinica SUVR outputs)
 
-- FDG: looks for trc-18FFDG + suvr-pons2_pet
-       normalization mask: pons (label 174)
-- AV45: looks for trc-18FAV45 + suvr-cerebellumPons2_pet
-        normalization mask: cerebellum (labels 7,8,46,47)
+Inputs (per session):
+- PET FDG SUVR:  pet_linear/*trc-18FFDG*space-MNI152NLin2009cSym*suvr-pons2_pet.nii.gz
+- PET AV45 SUVR: pet_linear/*trc-18FAV45*space-MNI152NLin2009cSym*suvr-cerebellumPons2_pet.nii.gz
+- Seg: t1/freesurfer_cross_sectional/<sub>_<ses>/mri/gtmseg_on_mni_affine.nii.gz
 
-Skips sessions without the requested PET file.
-
-Outputs:
-- per session: CAPS_DIR/subjects/<sub>/<ses>/pet_surface/<pet_norm_name>.nii.gz
-- global Excel:
-  PET_trc-<label>_suvr-<suvr>_statistics.xlsx
+Outputs (global, in BASE_DIR):
+- PET_trc-<trc>_suvr-<suvr>_statistics.xlsx
   sheets: Mean, MeanGMM, Std, Sample_Size
+
+Optional outputs (per session):
+- Copies the Clinica SUVR PET into:
+  CAPS_DIR/subjects/<sub>/<ses>/pet_surface/PET_trc-<trc>_suvr-<suvr>_pet.nii.gz
 """
 
 import os
@@ -27,18 +27,28 @@ from pathlib import Path
 import numpy as np
 import nibabel as nib
 import pandas as pd
-import mahotas
 from sklearn.mixture import GaussianMixture
 
 
-# ---------------- CONFIG DEFAULTS ----------------
 DEFAULT_BASE_DIR = "/Users/shahzadali/Desktop/ADNI"
 DEFAULT_CAPS_NAME = "CAPS_DIR"
 DEFAULT_FREESURFER_HOME = os.environ.get("FREESURFER_HOME", "/Applications/freesurfer/7.4.1/")
-# -----------------------------------------------
 
 
-# ---------------- Utility ----------------
+TRACER_CONFIG = {
+    "FDG": {
+        "trc": "18FFDG",
+        "pet_glob": "*trc-18FFDG*space-MNI152NLin2009cSym*suvr-pons2_pet.nii.gz",
+        "suvr_tag": "pons2",
+    },
+    "AV45": {
+        "trc": "18FAV45",
+        "pet_glob": "*trc-18FAV45*space-MNI152NLin2009cSym*suvr-cerebellumPons2_pet.nii.gz",
+        "suvr_tag": "cerebellumPons2",
+    },
+}
+
+
 def log_message(path: Path, message: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as f:
@@ -71,33 +81,6 @@ def robust_mode_GMM(values: np.ndarray) -> float:
     return float(means[np.argmax(means)])
 
 
-def erode_mask(mask: np.ndarray) -> np.ndarray:
-    """Remove border voxels (1-voxel erosion)."""
-    return np.bitwise_xor(mask, mahotas.bwperim(mask))
-
-
-def get_normalization_mask(seg_crop: np.ndarray, target: str) -> np.ndarray:
-    """
-    Returns a normalization mask given target:
-    - 'pons' uses label 174
-    - 'cb' uses labels 7,8,46,47 (cerebellum WM+cortex)
-    - 'wm' uses labels 2,41
-    """
-    if target == "pons":
-        pons = np.isin(seg_crop, [174])
-        return erode_mask(pons)
-
-    if target == "cb":
-        cb = np.isin(seg_crop, [7, 8, 46, 47])
-        return erode_mask(cb)
-
-    if target == "wm":
-        wm = np.isin(seg_crop, [2, 41])
-        return erode_mask(wm)
-
-    raise ValueError(f"Unsupported normalization target: {target}")
-
-
 def crop_to_pet_space(seg_array, seg_affine, pet_shape, pet_affine):
     """
     Crop segmentation to PET space using affine origins.
@@ -106,7 +89,6 @@ def crop_to_pet_space(seg_array, seg_affine, pet_shape, pet_affine):
     seg_origin = np.round(seg_affine[:3, 3], 2)
     pet_origin = np.round(pet_affine[:3, 3], 2)
     delta = np.abs(seg_origin - pet_origin).astype(int)
-
     return seg_array[
         delta[0]:delta[0] + pet_shape[0],
         delta[1]:delta[1] + pet_shape[1],
@@ -115,11 +97,9 @@ def crop_to_pet_space(seg_array, seg_affine, pet_shape, pet_affine):
 
 
 def load_freesurfer_lut(lut_path: Path) -> dict:
-    """Parse FreeSurferColorLUT.txt and return {label_id: label_name}."""
     lut = {}
     if not lut_path.exists():
         return lut
-
     with lut_path.open("r") as f:
         for line in f:
             line = line.strip()
@@ -137,33 +117,14 @@ def load_freesurfer_lut(lut_path: Path) -> dict:
 
 
 def label_id_to_name(label_id: int, lut: dict) -> str:
-    """Excel-safe row label: '<id>_<name>'."""
     return f"{label_id}_{lut.get(label_id, 'unknown')}"
-
-
-# ---------------- Tracer config ----------------
-TRACER_CONFIG = {
-    "FDG": {
-        "trc": "18FFDG",
-        "pet_glob": "*trc-18FFDG*space-MNI152NLin2009cSym*pons2_pet.nii.gz",
-        "norm_target": "pons",
-        "suvr_tag": "pons2",
-    },
-    "AV45": {
-        "trc": "18FAV45",
-        "pet_glob": "*trc-18FAV45*space-MNI152NLin2009cSym*cerebellumPons2_pet.nii.gz",
-        "norm_target": "cb",
-        "suvr_tag": "cerebellumPons2",
-    },
-}
 
 
 def find_caps_sessions(caps_dir: Path, pet_glob: str):
     """
-    Find sessions that have:
-      - requested tracer PET in pet_linear matching pet_glob
-      - GTMSeg on MNI (affine) in freesurfer_cross_sectional
-    Returns entries list; missing PET => skip.
+    Find subject-sessions having:
+      - matching PET SUVR file in pet_linear/
+      - gtmseg_on_mni_affine.nii.gz in FS folder
     """
     entries = []
     subjects_root = caps_dir / "subjects"
@@ -184,7 +145,6 @@ def find_caps_sessions(caps_dir: Path, pet_glob: str):
 
             pet_candidates = sorted(pet_linear_dir.glob(pet_glob))
             if not pet_candidates:
-                # no requested PET for this session
                 continue
             pet_path = pet_candidates[0]
 
@@ -195,13 +155,14 @@ def find_caps_sessions(caps_dir: Path, pet_glob: str):
             fs_subject_dirs = sorted(fs_parent.glob("sub-*_ses-*"))
             if not fs_subject_dirs:
                 continue
-            fs_subject_dir = fs_subject_dirs[0]
+
+            # Prefer the FS folder that matches this ses_dir if multiple exist
+            matching = [d for d in fs_subject_dirs if d.name.endswith(f"_{ses_dir.name}")]
+            fs_subject_dir = matching[0] if matching else fs_subject_dirs[0]
 
             seg_path = fs_subject_dir / "mri" / "gtmseg_on_mni_affine.nii.gz"
             if not seg_path.exists():
                 continue
-
-            out_dir = ses_dir / "pet_surface"
 
             entries.append({
                 "sub": sub_dir.name,
@@ -209,38 +170,37 @@ def find_caps_sessions(caps_dir: Path, pet_glob: str):
                 "ses_dir": ses_dir,
                 "pet_path": pet_path,
                 "seg_path": seg_path,
-                "out_dir": out_dir,
             })
 
     return entries
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--base_dir", type=str, default=DEFAULT_BASE_DIR, help="Base folder containing CAPS_DIR")
-    parser.add_argument("--caps_name", type=str, default=DEFAULT_CAPS_NAME, help="CAPS directory name")
-    parser.add_argument("--tracer", type=str, required=True, choices=["FDG", "AV45"], help="Tracer type")
-    parser.add_argument("--freesurfer_home", type=str, default=DEFAULT_FREESURFER_HOME, help="FreeSurfer home path")
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(description="Compute regional stats from Clinica SUVR PET (no normalization).")
+    parser.add_argument("--base_dir", type=str, default=DEFAULT_BASE_DIR)
+    parser.add_argument("--caps_name", type=str, default=DEFAULT_CAPS_NAME)
+    parser.add_argument("--tracer", type=str, required=True, choices=["FDG", "AV45"])
+    parser.add_argument("--freesurfer_home", type=str, default=DEFAULT_FREESURFER_HOME)
 
-    sys.setrecursionlimit(5000)
+    # minor but useful options
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing per-session pet_surface PET copy.")
+    parser.add_argument("--no_pet_surface_copy", action="store_true", help="Do not create a PET copy in pet_surface/.")
+
+    args = parser.parse_args()
 
     base_dir = Path(args.base_dir).expanduser().resolve()
     caps_dir = base_dir / args.caps_name
 
     cfg = TRACER_CONFIG[args.tracer]
-    pet_glob = cfg["pet_glob"]
-    norm_target = cfg["norm_target"]
     trc = cfg["trc"]
     suvr_tag = cfg["suvr_tag"]
+    pet_glob = cfg["pet_glob"]
 
-    # Logs + outputs
     log_file = base_dir / f"logSubjects_petstats_{args.tracer}.txt"
     warning_log = base_dir / f"logSubjects_petstats_{args.tracer}_warning.txt"
     excel_out = base_dir / f"PET_trc-{trc}_suvr-{suvr_tag}_statistics.xlsx"
 
-    # LUT
-    fs_lut_path = Path(args.freesurfer_home) / "FreeSurferColorLUT.txt"
+    fs_lut_path = Path(args.freesurfer_home).expanduser().resolve() / "FreeSurferColorLUT.txt"
     lut = load_freesurfer_lut(fs_lut_path)
     if lut:
         print(f"[INFO] Loaded FreeSurfer LUT: {fs_lut_path}")
@@ -248,12 +208,11 @@ def main():
         print(f"[WARN] Could not load LUT at: {fs_lut_path} (names will be 'unknown')")
 
     entries = find_caps_sessions(caps_dir, pet_glob=pet_glob)
-    print(f"[INFO] Tracer={args.tracer} | Found {len(entries)} sessions with matching PET + GTMSeg-on-MNI.")
+    print(f"[INFO] Tracer={args.tracer} | Found {len(entries)} sessions with matching Clinica SUVR PET + GTMSeg.")
 
-    df_meanGMM_all = pd.DataFrame()
-    df_mean_all = pd.DataFrame()
-    df_std_all = pd.DataFrame()
-    df_size_all = pd.DataFrame()
+    df_meanGMM_all, df_mean_all, df_std_all, df_size_all = (
+        pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    )
 
     start_time = time.time()
 
@@ -261,51 +220,40 @@ def main():
         subj_id = f"{e['sub']}_{e['ses']}"
         print(f"\n#### Processing {subj_id} ####")
 
-        pet_path = e["pet_path"]
-        seg_path = e["seg_path"]
-        out_dir = e["out_dir"]
-        out_dir.mkdir(parents=True, exist_ok=True)
+        pet_path = Path(e["pet_path"])
+        seg_path = Path(e["seg_path"])
+        ses_dir = Path(e["ses_dir"])
 
-        if not seg_path.exists():
-            log_message(warning_log, f"Segmentation missing for {subj_id}: {seg_path}")
-            continue
         if not pet_path.exists():
-            log_message(warning_log, f"PET missing for {subj_id}: {pet_path}")
+            log_message(warning_log, f"Missing PET for {subj_id}: {pet_path}")
+            continue
+        if not seg_path.exists():
+            log_message(warning_log, f"Missing seg for {subj_id}: {seg_path}")
             continue
 
-        # Load PET + seg
+        # Load PET (already SUVR) and segmentation
         pet_img = nib.load(str(pet_path))
         pet_data = pet_img.get_fdata(dtype="float32")
 
         seg_img = nib.load(str(seg_path))
         seg_data = seg_img.get_fdata(dtype="float32")
 
-        # Crop seg to PET if needed
+        # Align shapes if needed (crop)
         if seg_data.shape != pet_data.shape:
             seg_crop = crop_to_pet_space(seg_data, seg_img.affine, pet_data.shape, pet_img.affine)
         else:
             seg_crop = seg_data
 
-        # Normalization
-        norm_mask = get_normalization_mask(seg_crop, norm_target)
-        if np.count_nonzero(norm_mask) == 0:
-            log_message(warning_log, f"Empty norm mask for {subj_id} (target={norm_target})")
-            continue
+        # Optional: create pet_surface copy (same data, just a canonical filename)
+        if not args.no_pet_surface_copy:
+            out_dir = ses_dir / "pet_surface"
+            out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Your PET may already be SUVR-normalized; we still allow re-normalization.
-        norm_value = robust_mode_GMM(pet_data[norm_mask])
-        if not np.isfinite(norm_value) or norm_value == 0:
-            log_message(warning_log, f"Bad norm_value for {subj_id}: {norm_value}")
-            continue
+            pet_copy = out_dir / f"PET_trc-{trc}_suvr-{suvr_tag}_pet.nii.gz"
+            if args.overwrite or (not pet_copy.exists()):
+                nib.save(nib.Nifti1Image(pet_data, affine=pet_img.affine), str(pet_copy))
 
-        pet_norm = pet_data / norm_value
-
-        # Save normalized PET under pet_surface
-        # norm_pet_path = out_dir / f"PETonMNI_norm_{norm_target}.nii.gz"
-        norm_pet_path = out_dir / f"PET_trc-{trc}_suvr-{suvr_tag}_norm-{norm_target}.nii.gz"
-        nib.save(nib.Nifti1Image(pet_norm, affine=pet_img.affine), str(norm_pet_path))
-
-        # Regional stats: keep all regions, exclude only 0
+        # all regions except background
         labels = np.unique(seg_crop).astype(int)
         VOIs = [lab for lab in labels if lab != 0]
 
@@ -313,7 +261,7 @@ def main():
 
         for voi in VOIs:
             mask = (seg_crop == voi)
-            values = pet_norm[mask]
+            values = pet_data[mask]
             if values.size == 0:
                 continue
 
@@ -333,9 +281,8 @@ def main():
         df_std_all     = pd.concat([df_std_all,     pd.DataFrame(std_list,     index=idx_names, columns=col)], axis=1)
         df_size_all    = pd.concat([df_size_all,    pd.DataFrame(size_list,    index=idx_names, columns=col)], axis=1)
 
-        log_message(log_file, f"OK {subj_id} | PET={pet_path.name} | OUT={norm_pet_path}")
+        log_message(log_file, f"OK {subj_id} | PET={pet_path.name}")
 
-    # Save Excel
     with pd.ExcelWriter(str(excel_out)) as writer:
         df_mean_all.transpose().to_excel(writer, sheet_name="Mean")
         df_meanGMM_all.transpose().to_excel(writer, sheet_name="MeanGMM")
