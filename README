@@ -1,0 +1,72 @@
+# CAPS PET SUVR Regional Statistics (GTMseg-based)
+
+This repository contains a small set of scripts to compute **regional PET SUVR statistics** in a **Clinica CAPS** dataset using **FreeSurfer/PETSurfer GTMseg**.  
+It is designed for datasets where PET has already been linearly processed by Clinica (e.g., `pet_linear` with `suvr-pons2` or `suvr-cerebellumPons2` outputs).
+
+## Expected directory structure (CAPS)
+Example (per subject-session):
+- CAPS_DIR/subjects/sub-XXXX/ses-YYYY/
+- t1/freesurfer_cross_sectional/sub-XXXX_ses-YYYY/
+- mri/aseg.mgz
+- pet_linear/
+- trc-18FFDG_suvr-pons2_pet.nii.gz
+- trc-18FAV45_suvr-cerebellumPons2_pet.nii.gz
+
+
+
+## Pipelines / Scripts
+
+### 1) Run PETSurfer GTMseg on CAPS FreeSurfer outputs
+Runs GTMseg for each `freesurfer_cross_sectional` subject-session in CAPS.
+
+**Inputs**
+- `.../t1/freesurfer_cross_sectional/<sub>_<ses>/mri/aseg.mgz` (FreeSurfer output)
+
+**Outputs**
+- `.../t1/freesurfer_cross_sectional/<sub>_<ses>/mri/gtmseg.mgz` (and related PETSurfer outputs)
+
+### 2) Map GTMseg to MNI space (affine-only)
+Converts GTMseg to NIfTI and applies the affine transform from the linear pipeline to obtain an MNI-space segmentation aligned to PET.
+
+**Inputs**
+- `.../mri/gtmseg.mgz`
+- transforms from the linear pipeline:
+  - `mri/norm/MRIonMNI_0GenericAffine.mat`
+  - (warp optional; affine-only supported)
+
+**Outputs**
+- `.../mri/gtmseg_on_mni_affine.nii.gz`
+
+### 3) PET SUVR regional statistics (FDG / AV45)
+Computes regional PET statistics using the MNI-aligned GTMseg labels and Clinica SUVR PET images.
+
+**Inputs**
+- FDG: `pet_linear/*trc-18FFDG*space-MNI152NLin2009cSym*suvr-pons2_pet.nii.gz`
+- AV45: `pet_linear/*trc-18FAV45*space-MNI152NLin2009cSym*suvr-cerebellumPons2_pet.nii.gz`
+- Segmentation: `.../mri/gtmseg_on_mni_affine.nii.gz`
+
+**Outputs**
+- Copies the input SUVR PET into:
+  - `.../pet_surface/PET_trc-<trc>_suvr-<suvr>_pet.nii.gz`
+- Global Excel table (all available sessions for the tracer):
+  - `PET_trc-<trc>_suvr-<suvr>_statistics.xlsx`
+  - sheets: `Mean`, `MeanGMM`, `Std`, `Sample_Size`
+
+Region names are derived automatically from `FreeSurferColorLUT.txt`.
+
+## Usage
+
+### FDG statistics
+```bash
+python <script_name>.py --tracer FDG --base_dir /path/to/ADNI --caps_name CAPS_DIR
+```
+
+### AV45 statistics
+```bash
+python <script_name>.py --tracer AV45 --base_dir /path/to/ADNI --caps_name CAPS_DIR
+```
+
+## Requirements
+- FreeSurfer (with PETSurfer)
+- Python packages: numpy, nibabel, pandas, scikit-learn
+- (Optional) mahotas for border erosion (only if using custom normalization; stats-only pipeline does not require it)
