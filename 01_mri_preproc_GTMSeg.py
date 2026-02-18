@@ -191,7 +191,7 @@ def main():
         description="Run FreeSurfer GTMSeg on CAPS freesurfer_cross_sectional outputs."
     )
     parser.add_argument(
-        "--base_dir", type=str, default="/Users/shahzadali/Desktop/ADNI",
+        "--base_dir", type=str, default="/Volumes/Ali_X10Pro/ADNI",
         help="Base folder containing CAPS_DIR (default: /Users/shahzadali/Desktop/ADNI)"
     )
     parser.add_argument(
@@ -199,7 +199,7 @@ def main():
         help="CAPS directory name inside base_dir (default: CAPS_DIR)"
     )
     parser.add_argument(
-        "--batch_size", type=int, default=7,
+        "--batch_size", type=int, default=20,
         help="How many subject-sessions per batch (default: 7)"
     )
     parser.add_argument(

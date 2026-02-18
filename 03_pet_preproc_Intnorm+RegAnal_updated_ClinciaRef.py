@@ -3,37 +3,54 @@
 
 """
 CAPS PET Regional Statistics (NO normalization; uses Clinica SUVR outputs)
+UPDATED — CAPS-safe + parallel + restart-safe + single TSV status logging
+and robust seg->PET alignment via resampling (instead of origin-crop).
 
 Inputs (per session):
-- PET FDG SUVR:  pet_linear/*trc-18FFDG*space-MNI152NLin2009cSym*suvr-pons2_pet.nii.gz
-- PET AV45 SUVR: pet_linear/*trc-18FAV45*space-MNI152NLin2009cSym*suvr-cerebellumPons2_pet.nii.gz
-- Seg: t1/freesurfer_cross_sectional/<sub>_<ses>/mri/gtmseg_on_mni_affine.nii.gz
+- PET FDG SUVR:  <CAPS>/subjects/<sub>/<ses>/pet_linear/*trc-18FFDG*space-MNI152NLin2009cSym*suvr-pons2_pet.nii.gz
+- PET AV45 SUVR: <CAPS>/subjects/<sub>/<ses>/pet_linear/*trc-18FAV45*space-MNI152NLin2009cSym*suvr-cerebellumPons2_pet.nii.gz
+- Seg (MNI affine): <CAPS>/subjects/<sub>/<ses>/t1/freesurfer_cross_sectional/<sub>_<ses>/mri/gtmseg_on_mni_affine.nii.gz
 
 Outputs (global, in BASE_DIR):
 - PET_trc-<trc>_suvr-<suvr>_statistics.xlsx
   sheets: Mean, MeanGMM, Std, Sample_Size
 
 Optional outputs (per session):
-- Copies the Clinica SUVR PET into:
-  CAPS_DIR/subjects/<sub>/<ses>/pet_surface/PET_trc-<trc>_suvr-<suvr>_pet.nii.gz
+- Copies Clinica SUVR PET into:
+  <CAPS>/subjects/<sub>/<ses>/pet_surface/PET_trc-<trc>_suvr-<suvr>_pet.nii.gz
+
+Status TSV (in BASE_DIR):
+- logSubjects_petstats_status_<TRACER>.tsv (parallel-safe with .lock)
+
+Notes:
+- Uses NearestNeighbor for segmentation resampling.
+- Parallelizes per-session stats; Excel is written once at the end.
 """
 
 import os
 import sys
 import time
 import argparse
+import datetime
 from pathlib import Path
+from multiprocessing import cpu_count
 
 import numpy as np
 import nibabel as nib
 import pandas as pd
 from sklearn.mixture import GaussianMixture
+from joblib import Parallel, delayed
+
+# robust resampling (part of nibabel)
+from nibabel.processing import resample_from_to
+
+# pip install filelock
+from filelock import FileLock
 
 
-DEFAULT_BASE_DIR = "/Users/shahzadali/Desktop/ADNI"
+DEFAULT_BASE_DIR = "/Volumes/Ali_X10Pro/ADNI"
 DEFAULT_CAPS_NAME = "CAPS_DIR"
 DEFAULT_FREESURFER_HOME = os.environ.get("FREESURFER_HOME", "/Applications/freesurfer/7.4.1/")
-
 
 TRACER_CONFIG = {
     "FDG": {
@@ -49,12 +66,45 @@ TRACER_CONFIG = {
 }
 
 
-def log_message(path: Path, message: str):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as f:
-        f.write(message + "\n")
+# ----------------------------
+# TSV status logging (parallel-safe)
+# ----------------------------
+def _now_iso():
+    return datetime.datetime.now().isoformat(timespec="seconds")
 
 
+def append_status_tsv(tsv_path: Path, row: dict):
+    """
+    Append one row to a TSV file safely (parallel-safe via file lock).
+    """
+    tsv_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = FileLock(str(tsv_path) + ".lock")
+
+    columns = [
+        "timestamp",
+        "subject_id",
+        "session_id",
+        "status",
+        "stage",
+        "message",
+        "pet_path",
+        "seg_path",
+        "pet_copy",
+    ]
+    for c in columns:
+        row.setdefault(c, "")
+
+    with lock:
+        first_write = not tsv_path.exists()
+        with tsv_path.open("a") as f:
+            if first_write:
+                f.write("\t".join(columns) + "\n")
+            f.write("\t".join(str(row[c]) for c in columns) + "\n")
+
+
+# ----------------------------
+# PET stats utils
+# ----------------------------
 def robust_mode_GMM(values: np.ndarray) -> float:
     """
     Robust mode estimate using 2-component GMM.
@@ -81,21 +131,6 @@ def robust_mode_GMM(values: np.ndarray) -> float:
     return float(means[np.argmax(means)])
 
 
-def crop_to_pet_space(seg_array, seg_affine, pet_shape, pet_affine):
-    """
-    Crop segmentation to PET space using affine origins.
-    Works when differences are mainly origin shifts (same orientation).
-    """
-    seg_origin = np.round(seg_affine[:3, 3], 2)
-    pet_origin = np.round(pet_affine[:3, 3], 2)
-    delta = np.abs(seg_origin - pet_origin).astype(int)
-    return seg_array[
-        delta[0]:delta[0] + pet_shape[0],
-        delta[1]:delta[1] + pet_shape[1],
-        delta[2]:delta[2] + pet_shape[2],
-    ]
-
-
 def load_freesurfer_lut(lut_path: Path) -> dict:
     lut = {}
     if not lut_path.exists():
@@ -120,6 +155,20 @@ def label_id_to_name(label_id: int, lut: dict) -> str:
     return f"{label_id}_{lut.get(label_id, 'unknown')}"
 
 
+def resample_seg_to_pet(seg_img: nib.Nifti1Image, pet_img: nib.Nifti1Image) -> np.ndarray:
+    """
+    Robustly resample seg into PET grid using nearest neighbor.
+    Returns seg data in PET space (same shape as pet).
+    """
+    seg_rs = resample_from_to(seg_img, pet_img, order=0)  # NN for labels
+    seg_data = seg_rs.get_fdata(dtype="float32")
+    # labels must be integers
+    return np.rint(seg_data).astype(np.int32)
+
+
+# ----------------------------
+# Discovery
+# ----------------------------
 def find_caps_sessions(caps_dir: Path, pet_glob: str):
     """
     Find subject-sessions having:
@@ -164,29 +213,161 @@ def find_caps_sessions(caps_dir: Path, pet_glob: str):
             if not seg_path.exists():
                 continue
 
-            entries.append({
-                "sub": sub_dir.name,
-                "ses": ses_dir.name,
-                "ses_dir": ses_dir,
-                "pet_path": pet_path,
-                "seg_path": seg_path,
-            })
+            entries.append(
+                {
+                    "sub": sub_dir.name,
+                    "ses": ses_dir.name,
+                    "ses_dir": ses_dir,
+                    "pet_path": pet_path,
+                    "seg_path": seg_path,
+                }
+            )
 
     return entries
 
 
+# ----------------------------
+# Per-session worker
+# ----------------------------
+def process_one_session(
+    e: dict,
+    lut: dict,
+    trc: str,
+    suvr_tag: str,
+    pet_surface_copy: bool,
+    overwrite_pet_copy: bool,
+    status_tsv: Path,
+):
+    """
+    Returns:
+      subj_id, (Series meanGMM, Series mean, Series std, Series size)
+    or:
+      None if failed / skipped.
+    """
+    sub = e["sub"]
+    ses = e["ses"]
+    subj_id = f"{sub}_{ses}"
+
+    pet_path = Path(e["pet_path"])
+    seg_path = Path(e["seg_path"])
+    ses_dir = Path(e["ses_dir"])
+
+    pet_copy_path = ""
+    def log(status, stage, msg):
+        append_status_tsv(
+            status_tsv,
+            {
+                "timestamp": _now_iso(),
+                "subject_id": sub,
+                "session_id": ses,
+                "status": status,
+                "stage": stage,
+                "message": msg,
+                "pet_path": str(pet_path),
+                "seg_path": str(seg_path),
+                "pet_copy": str(pet_copy_path) if pet_copy_path else "",
+            },
+        )
+
+    # Basic checks
+    if not pet_path.exists():
+        log("FAILED", "precheck", f"Missing PET: {pet_path}")
+        return None
+    if not seg_path.exists():
+        log("FAILED", "precheck", f"Missing seg: {seg_path}")
+        return None
+
+    try:
+        pet_img = nib.load(str(pet_path))
+        pet_data = pet_img.get_fdata(dtype="float32")
+    except Exception as ex:
+        log("FAILED", "load_pet", f"Failed to load PET: {repr(ex)}")
+        return None
+
+    try:
+        seg_img = nib.load(str(seg_path))
+    except Exception as ex:
+        log("FAILED", "load_seg", f"Failed to load seg: {repr(ex)}")
+        return None
+
+    # Robust alignment: resample seg to PET grid
+    try:
+        seg_pet = resample_seg_to_pet(seg_img, pet_img)
+    except Exception as ex:
+        log("FAILED", "resample_seg", f"Failed seg->PET resample: {repr(ex)}")
+        return None
+
+    # Optional: create pet_surface copy
+    if pet_surface_copy:
+        out_dir = ses_dir / "pet_surface"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        pet_copy = out_dir / f"PET_trc-{trc}_suvr-{suvr_tag}_pet.nii.gz"
+        pet_copy_path = pet_copy
+        try:
+            if overwrite_pet_copy or (not pet_copy.exists()):
+                nib.save(nib.Nifti1Image(pet_data, affine=pet_img.affine), str(pet_copy))
+        except Exception as ex:
+            # Non-fatal
+            log("WARNING", "pet_copy", f"Could not write pet_surface copy: {repr(ex)}")
+
+    # VOI stats
+    labels = np.unique(seg_pet).astype(np.int32)
+    vois = [lab for lab in labels if lab != 0]
+
+    meanGMM_list, mean_list, std_list, size_list, idx_names = [], [], [], [], []
+
+    for voi in vois:
+        mask = (seg_pet == voi)
+        values = pet_data[mask]
+        if values.size == 0:
+            continue
+
+        stat_gmm = robust_mode_GMM(values)
+        if not np.isfinite(stat_gmm):
+            continue
+
+        idx_names.append(label_id_to_name(int(voi), lut))
+        meanGMM_list.append(stat_gmm)
+        mean_list.append(float(np.mean(values)))
+        std_list.append(float(np.std(values)))
+        size_list.append(int(np.count_nonzero(mask)))
+
+    if len(idx_names) == 0:
+        log("FAILED", "stats", "No valid VOIs after masking (empty stats).")
+        return None
+
+    s_meanGMM = pd.Series(meanGMM_list, index=idx_names, name=subj_id)
+    s_mean    = pd.Series(mean_list,    index=idx_names, name=subj_id)
+    s_std     = pd.Series(std_list,     index=idx_names, name=subj_id)
+    s_size    = pd.Series(size_list,    index=idx_names, name=subj_id)
+
+    log("COMPLETED", "done", f"OK | PET={pet_path.name} | n_vois={len(idx_names)}")
+    return subj_id, s_meanGMM, s_mean, s_std, s_size
+
+
+# ----------------------------
+# Main
+# ----------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Compute regional stats from Clinica SUVR PET (no normalization).")
+    parser = argparse.ArgumentParser(description="Compute regional stats from Clinica SUVR PET (no normalization) using GTMSeg labels.")
     parser.add_argument("--base_dir", type=str, default=DEFAULT_BASE_DIR)
     parser.add_argument("--caps_name", type=str, default=DEFAULT_CAPS_NAME)
     parser.add_argument("--tracer", type=str, required=True, choices=["FDG", "AV45"])
     parser.add_argument("--freesurfer_home", type=str, default=DEFAULT_FREESURFER_HOME)
 
-    # minor but useful options
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing per-session pet_surface PET copy.")
-    parser.add_argument("--no_pet_surface_copy", action="store_true", help="Do not create a PET copy in pet_surface/.")
+    # parallel
+    parser.add_argument("--n_jobs", type=int, default=None, help="Parallel jobs (default: cpu_count)")
+    parser.add_argument("--batch_size", type=int, default=100, help="Batch size for progress printing (default: 50)")
+
+    # outputs
+    parser.add_argument("--overwrite_excel", action="store_true", help="Overwrite Excel if exists.")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite per-session pet_surface PET copy.")
+    parser.add_argument("--pet_surface_copy", action="store_true", default=False, help="Copy PET into pet_surface/ (default: False).")
+
 
     args = parser.parse_args()
+
+    sys.setrecursionlimit(5000)
 
     base_dir = Path(args.base_dir).expanduser().resolve()
     caps_dir = base_dir / args.caps_name
@@ -196,10 +377,10 @@ def main():
     suvr_tag = cfg["suvr_tag"]
     pet_glob = cfg["pet_glob"]
 
-    log_file = base_dir / f"logSubjects_petstats_{args.tracer}.txt"
-    warning_log = base_dir / f"logSubjects_petstats_{args.tracer}_warning.txt"
     excel_out = base_dir / f"PET_trc-{trc}_suvr-{suvr_tag}_statistics.xlsx"
+    status_tsv = base_dir / f"logSubjects_petstats_status_{args.tracer}.tsv"
 
+    # LUT
     fs_lut_path = Path(args.freesurfer_home).expanduser().resolve() / "FreeSurferColorLUT.txt"
     lut = load_freesurfer_lut(fs_lut_path)
     if lut:
@@ -207,89 +388,72 @@ def main():
     else:
         print(f"[WARN] Could not load LUT at: {fs_lut_path} (names will be 'unknown')")
 
+    # discovery
     entries = find_caps_sessions(caps_dir, pet_glob=pet_glob)
-    print(f"[INFO] Tracer={args.tracer} | Found {len(entries)} sessions with matching Clinica SUVR PET + GTMSeg.")
+    print(f"[INFO] Tracer={args.tracer} | Found {len(entries)} sessions with matching Clinica SUVR PET + GTMSeg seg.")
 
-    df_meanGMM_all, df_mean_all, df_std_all, df_size_all = (
-        pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    )
+    if len(entries) == 0:
+        print("[WARN] No sessions found. Exiting.")
+        return
+
+    # excel overwrite policy
+    if excel_out.exists() and (not args.overwrite_excel):
+        print(f"[ERROR] Excel already exists: {excel_out}")
+        print("        Use --overwrite_excel to overwrite.")
+        return
+
+    if args.n_jobs is None:
+        args.n_jobs = cpu_count()
 
     start_time = time.time()
 
-    for e in entries:
-        subj_id = f"{e['sub']}_{e['ses']}"
-        print(f"\n#### Processing {subj_id} ####")
+    # run in parallel
+    results = []
+    total = len(entries)
 
-        pet_path = Path(e["pet_path"])
-        seg_path = Path(e["seg_path"])
-        ses_dir = Path(e["ses_dir"])
+    # chunked progress: run Parallel on full list, but print progress per batch in main
+    for i in range(0, total, args.batch_size):
+        batch = entries[i:i + args.batch_size]
+        batch_results = Parallel(n_jobs=int(args.n_jobs))(
+            delayed(process_one_session)(
+                e,
+                lut,
+                trc,
+                suvr_tag,
+                args.pet_surface_copy,
+                args.overwrite,
+                status_tsv,
+            )
+            for e in batch
+        )
+        results.extend([r for r in batch_results if r is not None])
+        print(f"[INFO] Batch {i // args.batch_size + 1} done ({min(i + args.batch_size, total)}/{total}) | ok={len(results)}")
 
-        if not pet_path.exists():
-            log_message(warning_log, f"Missing PET for {subj_id}: {pet_path}")
-            continue
-        if not seg_path.exists():
-            log_message(warning_log, f"Missing seg for {subj_id}: {seg_path}")
-            continue
+    if len(results) == 0:
+        print("[ERROR] No successful sessions. Check TSV for failures:")
+        print(f"        {status_tsv}")
+        return
 
-        # Load PET (already SUVR) and segmentation
-        pet_img = nib.load(str(pet_path))
-        pet_data = pet_img.get_fdata(dtype="float32")
+    # aggregate to DataFrames
+    meanGMM_series = [r[1] for r in results]
+    mean_series    = [r[2] for r in results]
+    std_series     = [r[3] for r in results]
+    size_series    = [r[4] for r in results]
 
-        seg_img = nib.load(str(seg_path))
-        seg_data = seg_img.get_fdata(dtype="float32")
+    df_meanGMM = pd.concat(meanGMM_series, axis=1)
+    df_mean    = pd.concat(mean_series, axis=1)
+    df_std     = pd.concat(std_series, axis=1)
+    df_size    = pd.concat(size_series, axis=1)
 
-        # Align shapes if needed (crop)
-        if seg_data.shape != pet_data.shape:
-            seg_crop = crop_to_pet_space(seg_data, seg_img.affine, pet_data.shape, pet_img.affine)
-        else:
-            seg_crop = seg_data
-
-        # Optional: create pet_surface copy (same data, just a canonical filename)
-        if not args.no_pet_surface_copy:
-            out_dir = ses_dir / "pet_surface"
-            out_dir.mkdir(parents=True, exist_ok=True)
-
-            pet_copy = out_dir / f"PET_trc-{trc}_suvr-{suvr_tag}_pet.nii.gz"
-            if args.overwrite or (not pet_copy.exists()):
-                nib.save(nib.Nifti1Image(pet_data, affine=pet_img.affine), str(pet_copy))
-
-        # all regions except background
-        labels = np.unique(seg_crop).astype(int)
-        VOIs = [lab for lab in labels if lab != 0]
-
-        meanGMM_list, mean_list, std_list, size_list, idx_names = [], [], [], [], []
-
-        for voi in VOIs:
-            mask = (seg_crop == voi)
-            values = pet_data[mask]
-            if values.size == 0:
-                continue
-
-            stat_gmm = robust_mode_GMM(values)
-            if not np.isfinite(stat_gmm):
-                continue
-
-            idx_names.append(label_id_to_name(int(voi), lut))
-            meanGMM_list.append(stat_gmm)
-            mean_list.append(float(np.mean(values)))
-            std_list.append(float(np.std(values)))
-            size_list.append(int(np.count_nonzero(mask)))
-
-        col = pd.MultiIndex.from_product([[subj_id]])
-        df_meanGMM_all = pd.concat([df_meanGMM_all, pd.DataFrame(meanGMM_list, index=idx_names, columns=col)], axis=1)
-        df_mean_all    = pd.concat([df_mean_all,    pd.DataFrame(mean_list,    index=idx_names, columns=col)], axis=1)
-        df_std_all     = pd.concat([df_std_all,     pd.DataFrame(std_list,     index=idx_names, columns=col)], axis=1)
-        df_size_all    = pd.concat([df_size_all,    pd.DataFrame(size_list,    index=idx_names, columns=col)], axis=1)
-
-        log_message(log_file, f"OK {subj_id} | PET={pet_path.name}")
-
+    # write excel (subjects as rows)
     with pd.ExcelWriter(str(excel_out)) as writer:
-        df_mean_all.transpose().to_excel(writer, sheet_name="Mean")
-        df_meanGMM_all.transpose().to_excel(writer, sheet_name="MeanGMM")
-        df_std_all.transpose().to_excel(writer, sheet_name="Std")
-        df_size_all.transpose().to_excel(writer, sheet_name="Sample_Size")
+        df_mean.transpose().to_excel(writer, sheet_name="Mean")
+        df_meanGMM.transpose().to_excel(writer, sheet_name="MeanGMM")
+        df_std.transpose().to_excel(writer, sheet_name="Std")
+        df_size.transpose().to_excel(writer, sheet_name="Sample_Size")
 
     print(f"\n[INFO] Saved Excel: {excel_out}")
+    print(f"[INFO] Status TSV: {status_tsv}")
     print(f"--- {time.time() - start_time:.2f} seconds ---")
 
 
